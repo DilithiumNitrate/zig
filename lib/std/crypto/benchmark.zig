@@ -315,6 +315,71 @@ pub fn benchmarkAead(comptime Aead: anytype, comptime bytes: comptime_int) !u64 
     return throughput;
 }
 
+const salsalikes = [_]Crypto{
+    Crypto{ .ty = crypto.stream.chacha.ChaCha20IETF, .name = "chacha20" },
+    Crypto{ .ty = crypto.stream.chacha.XChaCha20IETF, .name = "xchacha20" },
+    Crypto{ .ty = crypto.stream.chacha.XChaCha8IETF, .name = "xchacha8" },
+    Crypto{ .ty = crypto.stream.salsa.XSalsa20, .name = "xsalsa20" },
+};
+
+pub fn benchmarkSalsalike(comptime Stream: anytype, comptime bytes: comptime_int) !u64 {
+    var in: [512 * KiB]u8 = undefined;
+    random.bytes(in[0..]);
+
+    var key: [Stream.key_length]u8 = undefined;
+    random.bytes(key[0..]);
+
+    var nonce: [Stream.nonce_length]u8 = undefined;
+    random.bytes(nonce[0..]);
+
+    var offset: usize = 0;
+    var timer = try Timer.start();
+    const start = timer.lap();
+    while (offset < bytes) : (offset += in.len) {
+        Stream.xor(in[0..], in[0..], @truncate(offset), key, nonce);
+    }
+    mem.doNotOptimizeAway(&in);
+    const end = timer.read();
+
+    const elapsed_s = @as(f64, @floatFromInt(end - start)) / time.ns_per_s;
+    const throughput = @as(u64, @intFromFloat(2 * bytes / elapsed_s));
+
+    return throughput;
+}
+
+const ctr = [_]Crypto{
+    Crypto{ .ty = crypto.core.aes.Aes128, .name = "aes128-ctr" },
+    Crypto{ .ty = crypto.core.aes.Aes256, .name = "aes256-ctr" },
+};
+
+pub fn benchmarkCtr(comptime Cipher: anytype, comptime bytes: comptime_int) !u64 {
+    var in: [512 * KiB]u8 = undefined;
+    random.bytes(in[0..]);
+
+    var key: [Cipher.key_bits / 8]u8 = undefined;
+    random.bytes(key[0..]);
+
+    const ctx = Cipher.initEnc(key);
+    const CipherCtx = @TypeOf(ctx);
+
+    var nonce: [CipherCtx.block_length]u8 = undefined;
+    random.bytes(nonce[0..]);
+
+    var offset: usize = 0;
+    var timer = try Timer.start();
+    const start = timer.lap();
+    while (offset < bytes) : (offset += in.len) {
+        crypto.core.modes.ctr(CipherCtx, ctx, in[0..], in[0..], nonce, builtin.cpu.arch.endian());
+    }
+    mem.doNotOptimizeAway(&in);
+    const end = timer.read();
+
+    const elapsed_s = @as(f64, @floatFromInt(end - start)) / time.ns_per_s;
+    const throughput = @as(u64, @intFromFloat(2 * bytes / elapsed_s));
+
+    return throughput;
+}
+
 const aes = [_]Crypto{
     Crypto{ .ty = crypto.core.aes.Aes128, .name = "aes128-single" },
     Crypto{ .ty = crypto.core.aes.Aes256, .name = "aes256-single" },
@@ -463,7 +528,7 @@ pub fn main() !void {
             i += 1;
             if (i == args.len) {
                 usage();
-                std.os.exit(1);
+                std.process.exit(1);
             }
 
             const seed = try std.fmt.parseUnsigned(u32, args[i], 10);
@@ -472,7 +537,7 @@ pub fn main() !void {
             i += 1;
             if (i == args.len) {
                 usage();
-                std.os.exit(1);
+                std.process.exit(1);
             }
 
             filter = args[i];
@@ -481,7 +546,7 @@ pub fn main() !void {
             return;
         } else {
             usage();
-            std.os.exit(1);
+            std.process.exit(1);
         }
     }
 
@@ -530,6 +595,20 @@ pub fn main() !void {
     inline for (aeads) |E| {
         if (filter == null or std.mem.indexOf(u8, E.name, filter.?) != null) {
             const throughput = try benchmarkAead(E.ty, mode(128 * MiB));
+            try stdout.print("{s:>17}: {:10} MiB/s\n", .{ E.name, throughput / (1 * MiB) });
+        }
+    }
+
+    inline for (salsalikes) |E| {
+        if (filter == null or std.mem.indexOf(u8, E.name, filter.?) != null) {
+            const throughput = try benchmarkSalsalike(E.ty, mode(128 * MiB));
+            try stdout.print("{s:>17}: {:10} MiB/s\n", .{ E.name, throughput / (1 * MiB) });
+        }
+    }
+
+    inline for (ctr) |E| {
+        if (filter == null or std.mem.indexOf(u8, E.name, filter.?) != null) {
+            const throughput = try benchmarkCtr(E.ty, mode(128 * MiB));
             try stdout.print("{s:>17}: {:10} MiB/s\n", .{ E.name, throughput / (1 * MiB) });
         }
     }
