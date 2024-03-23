@@ -1,8 +1,55 @@
 const std = @import("../../std.zig");
+const simd = std.simd;
 const builtin = @import("builtin");
 const mem = std.mem;
 const debug = std.debug;
-const BlockVec = @Vector(2, u64);
+
+inline fn WideBlockVec(comptime lanes: usize) type {
+    return @Vector(2 * lanes, u64);
+}
+const BlockVec = WideBlockVec(1);
+
+/// Encrypt a vector of blocks with a corresponding round key vector.
+/// Using a parameter higher than 1 requires VAES.
+inline fn encryptMulti(comptime lanes: usize, in: WideBlockVec(lanes), keys: @TypeOf(in)) @TypeOf(in) {
+    // Dev's note: the repeat use of @TypeOf(in) isn't just for brevity, it also saves on comptime branches.
+    return asm (
+        \\ vaesenc %[rk], %[in], %[out]
+        : [out] "=x" (-> @TypeOf(in)),
+        : [in] "x" (in),
+          [rk] "x" (keys),
+    );
+}
+
+/// Decrypt a vector of blocks with a corresponding round key vector.
+inline fn decryptMulti(comptime lanes: usize, in: WideBlockVec(lanes), inv_keys: @TypeOf(in)) @TypeOf(in) {
+    return asm (
+        \\ vaesdec %[rk], %[in], %[out]
+        : [out] "=x" (-> @TypeOf(in)),
+        : [in] "x" (in),
+          [rk] "x" (inv_keys),
+    );
+}
+
+/// Perform a final encryption on a vector of blocks with a corresponding round key vector.
+inline fn encryptMultiLast(comptime lanes: usize, in: WideBlockVec(lanes), keys: @TypeOf(in)) @TypeOf(in) {
+    return asm (
+        \\ vaesenclast %[rk], %[in], %[out]
+        : [out] "=x" (-> @TypeOf(in)),
+        : [in] "x" (in),
+          [rk] "x" (keys),
+    );
+}
+
+/// Perform a final encryption on a vector of blocks with a corresponding round key vector.
+inline fn decryptMultiLast(comptime lanes: usize, in: WideBlockVec(lanes), inv_keys: @TypeOf(in)) @TypeOf(in) {
+    return asm (
+        \\ vaesdeclast %[rk], %[in], %[out]
+        : [out] "=x" (-> @TypeOf(in)),
+        : [in] "x" (in),
+          [rk] "x" (inv_keys),
+    );
+}
 
 /// A single AES block.
 pub const Block = struct {
@@ -31,48 +78,28 @@ pub const Block = struct {
     /// Encrypt a block with a round key.
     pub inline fn encrypt(block: Block, round_key: Block) Block {
         return Block{
-            .repr = asm (
-                \\ vaesenc %[rk], %[in], %[out]
-                : [out] "=x" (-> BlockVec),
-                : [in] "x" (block.repr),
-                  [rk] "x" (round_key.repr),
-            ),
+            .repr = encryptMulti(1, block.repr, round_key.repr)
         };
     }
 
     /// Encrypt a block with the last round key.
     pub inline fn encryptLast(block: Block, round_key: Block) Block {
         return Block{
-            .repr = asm (
-                \\ vaesenclast %[rk], %[in], %[out]
-                : [out] "=x" (-> BlockVec),
-                : [in] "x" (block.repr),
-                  [rk] "x" (round_key.repr),
-            ),
+            .repr = encryptMultiLast(1, block.repr, round_key.repr)
         };
     }
 
     /// Decrypt a block with a round key.
     pub inline fn decrypt(block: Block, inv_round_key: Block) Block {
         return Block{
-            .repr = asm (
-                \\ vaesdec %[rk], %[in], %[out]
-                : [out] "=x" (-> BlockVec),
-                : [in] "x" (block.repr),
-                  [rk] "x" (inv_round_key.repr),
-            ),
+            .repr = decryptMulti(1, block.repr, inv_round_key.repr)
         };
     }
 
     /// Decrypt a block with the last round key.
     pub inline fn decryptLast(block: Block, inv_round_key: Block) Block {
         return Block{
-            .repr = asm (
-                \\ vaesdeclast %[rk], %[in], %[out]
-                : [out] "=x" (-> BlockVec),
-                : [in] "x" (block.repr),
-                  [rk] "x" (inv_round_key.repr),
-            ),
+            .repr = decryptMultiLast(1, block.repr, inv_round_key.repr)
         };
     }
 
@@ -96,7 +123,7 @@ pub const Block = struct {
         const cpu = std.Target.x86.cpu;
 
         /// The recommended number of AES encryption/decryption to perform in parallel for the chosen implementation.
-        pub const optimal_parallel_blocks = switch (builtin.cpu.model) {
+        pub const optimal_parallel_vectors = switch (builtin.cpu.model) {
             &cpu.westmere, &cpu.goldmont => 3,
             &cpu.cannonlake, &cpu.skylake, &cpu.skylake_avx512, &cpu.tremont, &cpu.goldmont_plus, &cpu.cascadelake => 4,
             &cpu.icelake_client, &cpu.icelake_server, &cpu.tigerlake, &cpu.rocketlake, &cpu.alderlake => 6,
@@ -106,10 +133,37 @@ pub const Block = struct {
             else => 8,
         };
 
+        pub const lane_count = w: {
+            if (std.Target.x86.featureSetHas(builtin.cpu.features, .vaes)) {
+                if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)) {
+                    break :w 4; // can perform 512-bit VAES if both are present
+                }
+                break :w 2; // VAES depends on AVX, and guarantees a 256-bit mode
+            }
+            break :w 1;
+        };
+
+        const Multi = WideBlockVec(lane_count);
+
+        pub const optimal_parallel_blocks = lane_count * optimal_parallel_vectors;
+
+        inline fn toVectorized(blocks: [lane_count]Block) Multi {
+            return @bitCast(blocks);
+        }
+
+        inline fn fromVectorized(wide: Multi) [lane_count]Block {
+            return @bitCast(wide);
+        }
+
         /// Encrypt multiple blocks in parallel, each their own round key.
         pub inline fn encryptParallel(comptime count: usize, blocks: [count]Block, round_keys: [count]Block) [count]Block {
             comptime var i = 0;
             var out: [count]Block = undefined;
+            inline while (i < count) : (i += lane_count) {
+                const in_slice = toVectorized(blocks[i..][0..lane_count].*);
+                const key_slice = toVectorized(round_keys[i..][0..lane_count].*);
+                out[i..][0..lane_count].* = fromVectorized(encryptMulti(lane_count, in_slice, key_slice));
+            }
             inline while (i < count) : (i += 1) {
                 out[i] = blocks[i].encrypt(round_keys[i]);
             }
@@ -129,7 +183,12 @@ pub const Block = struct {
         /// Encrypt multiple blocks in parallel with the same round key.
         pub inline fn encryptWide(comptime count: usize, blocks: [count]Block, round_key: Block) [count]Block {
             comptime var i = 0;
+            const spread_key: Multi = simd.repeat(lane_count * 2, round_key.repr);
             var out: [count]Block = undefined;
+            inline while (i < count) : (i += lane_count) {
+                const in_slice = toVectorized(blocks[i..][0..lane_count].*);
+                out[i..][0..lane_count].* = fromVectorized(encryptMulti(lane_count, in_slice, spread_key));
+            }
             inline while (i < count) : (i += 1) {
                 out[i] = blocks[i].encrypt(round_key);
             }
@@ -139,7 +198,12 @@ pub const Block = struct {
         /// Decrypt multiple blocks in parallel with the same round key.
         pub inline fn decryptWide(comptime count: usize, blocks: [count]Block, round_key: Block) [count]Block {
             comptime var i = 0;
+            const spread_key: Multi = simd.repeat(lane_count * 2, round_key.repr);
             var out: [count]Block = undefined;
+            inline while (i < count) : (i += lane_count) {
+                const in_slice = toVectorized(blocks[i..][0..lane_count].*);
+                out[i..][0..lane_count].* = fromVectorized(decryptMulti(lane_count, in_slice, spread_key));
+            }
             inline while (i < count) : (i += 1) {
                 out[i] = blocks[i].decrypt(round_key);
             }
